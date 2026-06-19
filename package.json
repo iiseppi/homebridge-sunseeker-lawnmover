@@ -30,7 +30,10 @@
     "watch": "npm run build && npm link && nodemon"
   },
   "dependencies": {
-    "homebridge-lib": "^8.0.1"
+    "axios": "^1.16.1",
+    "fakegato-history": "^0.6.7",
+    "homebridge-lib": "^8.0.1",
+    "mqtt": "^5.15.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

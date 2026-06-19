@@ -1,17 +1,33 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "SunseekerMower",
   "pluginType": "platform",
   "singular": true,
-  "strictValidation": false,
   "schema": {
     "type": "object",
-    "required": ["name"],
-    "additionalProperties": false,
     "properties": {
-      "name": {
-        "title": "Name",
+      "email": {
+        "title": "Sähköpostiosoite",
         "type": "string",
-        "default": "Example Dynamic Platform"
+        "required": true,
+        "format": "email",
+        "description": "Tilisi sähköpostiosoite."
+      },
+      "password": {
+        "title": "Salasana",
+        "type": "string",
+        "required": true
+      },
+      "serverType": {
+        "title": "Leikkurin tyyppi / Palvelin",
+        "type": "string",
+        "required": true,
+        "default": "old",
+        "description": "Valitse mitä pilvipalvelinta leikkurisi käyttää.",
+        "oneOf": [
+          { "title": "Vanhat mallit (esim. S-sarja)", "enum": ["old"] },
+          { "title": "Uudet mallit - Eurooppa (X & V -sarjat)", "enum": ["new_eu"] },
+          { "title": "Uudet mallit - USA", "enum": ["new_us"] }
+        ]
       }
     }
   }

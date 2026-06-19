@@ -1,148 +1,199 @@
-import type { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
+import { Service, PlatformAccessory, CharacteristicValue } from 'homebridge';
+import { SunseekerMowerPlatform } from './platform.js';
+import axios from 'axios';
+import * as https from 'https';
+import * as mqtt from 'mqtt';
+// @ts-ignore
+import fakegato from 'fakegato-history';
 
-import type { ExampleHomebridgePlatform } from './platform.js';
-
-/**
- * Platform Accessory
- * An instance of this class is created for each accessory your platform registers
- * Each accessory may expose multiple services of different service types.
- */
-export class ExamplePlatformAccessory {
-  private service: Service;
-
-  /**
-   * These are just used to create a working example
-   * You should implement your own code to track the state of your accessory
-   */
-  private exampleStates = {
-    On: false,
-    Brightness: 100,
-  };
+export class SunseekerMowerAccessory {
+  private mainSwitchService: Service;
+  private edgeSwitchService: Service;
+  private stopButtonService: Service;
+  private batteryService: Service;
+  private stuckSensorService: Service;
+  private batteryGraphService: Service;
+  
+  private mqttClient?: mqtt.MqttClient;
+  private loggingService: any;
 
   constructor(
-    private readonly platform: ExampleHomebridgePlatform,
+    private readonly platform: SunseekerMowerPlatform,
     private readonly accessory: PlatformAccessory,
   ) {
-    // set accessory information
+    const device = this.accessory.context.device;
+    const FakeGatoHistoryService = fakegato(this.platform.api);
+
+    // --- SIIVOTAAN VANHAT HAAMUPALVELUT VÄLIMUISTISTA ---
+    const allowedSubtypes = ['main_mow', 'edge_mow', 'stop_btn', 'stuck_sensor', 'battery_graph'];
+    this.accessory.services.forEach((service) => {
+      if (
+        (service.UUID === this.platform.Service.Switch.UUID || 
+         service.UUID === this.platform.Service.MotionSensor.UUID ||
+         service.UUID === this.platform.Service.HumiditySensor.UUID) &&
+        (!service.subtype || !allowedSubtypes.includes(service.subtype))
+      ) {
+        this.platform.log.info(`Poistetaan vanha haamupalvelu välimuistista: ${service.displayName}`);
+        this.accessory.removeService(service);
+      }
+    });
+
+    // 1. Alustetaan FakeGato-historia sääprofiililla
+    this.loggingService = new FakeGatoHistoryService('weather', this.accessory, {
+      storage: 'fs',
+      filename: `homebridge-sunseeker-history_${device.deviceSn}.json`,
+    });
+
+    // 2. Laitetiedot Apple Kotiin
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
-      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Default-Manufacturer')
-      .setCharacteristic(this.platform.Characteristic.Model, 'Default-Model')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, 'Default-Serial');
+      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Sunseeker / G-Force')
+      .setCharacteristic(this.platform.Characteristic.Model, device.deviceModelName || 'Mower S-Series')
+      .setCharacteristic(this.platform.Characteristic.SerialNumber, device.deviceSn);
 
-    // get the LightBulb service if it exists, otherwise create a new LightBulb service
-    // you can create multiple services for each accessory
+    // 3. Pääkytkin: LEIKKAUS
+    this.mainSwitchService = this.accessory.getService('Leikkaus') || 
+                             this.accessory.addService(this.platform.Service.Switch, 'Leikkaus', 'main_mow');
+    this.mainSwitchService.setCharacteristic(this.platform.Characteristic.Name, 'Leikkaus');
+    this.mainSwitchService.getCharacteristic(this.platform.Characteristic.On)
+      .onSet(this.setMainSwitchState.bind(this))
+      .onGet(this.getMowerState.bind(this));
 
-    if (accessory.context.device.CustomService) {
-      // This is only required when using Custom Services and Characteristics not support by HomeKit
-      this.service = this.accessory.getService(this.platform.CustomServices[accessory.context.device.CustomService]) ||
-        this.accessory.addService(this.platform.CustomServices[accessory.context.device.CustomService]);
-    } else {
-      this.service = this.accessory.getService(this.platform.Service.Lightbulb) || this.accessory.addService(this.platform.Service.Lightbulb);
+    // 4. Alikytkin: REUNALEIKKUU
+    this.edgeSwitchService = this.accessory.getService('Reunaleikkuu') || 
+                             this.accessory.addService(this.platform.Service.Switch, 'Reunaleikkuu', 'edge_mow');
+    this.edgeSwitchService.setCharacteristic(this.platform.Characteristic.Name, 'Reunaleikkuu');
+    this.edgeSwitchService.getCharacteristic(this.platform.Characteristic.On)
+      .onSet(this.setEdgeSwitchState.bind(this));
+
+    // 5. Painike: PYSÄYTÄ
+    this.stopButtonService = this.accessory.getService('Pysäytä') || 
+                             this.accessory.addService(this.platform.Service.Switch, 'Pysäytä', 'stop_btn');
+    this.stopButtonService.setCharacteristic(this.platform.Characteristic.Name, 'Pysäytä');
+    this.stopButtonService.getCharacteristic(this.platform.Characteristic.On)
+      .onSet(this.setStopButtonState.bind(this));
+
+    // 6. Liiketunnistin: JUMIUTUMISEN ILMAISIN
+    this.stuckSensorService = this.accessory.getService('Mower Jumissa') || 
+                              this.accessory.addService(this.platform.Service.MotionSensor, 'Mower Jumissa', 'stuck_sensor');
+    this.stuckSensorService.setCharacteristic(this.platform.Characteristic.Name, 'Mower Jumissa');
+
+    // 7. AKKUPALVELU (Apple taustajärjestelmä)
+    this.batteryService = this.accessory.getService(this.platform.Service.Battery) || 
+                          this.accessory.addService(this.platform.Service.Battery);
+
+    // 8. EVE-AKKUGRAAFI (Kosteusanturi akun seurantaan)
+    this.batteryGraphService = this.accessory.getService('Akun varaus') ||
+                               this.accessory.addService(this.platform.Service.HumiditySensor, 'Akun varaus', 'battery_graph');
+    this.batteryGraphService.setCharacteristic(this.platform.Characteristic.Name, 'Akun varaus');
+
+    // Päivitetään alkutilanne HTTP-datasta
+    this.updateUI(device.workStatusCode, device.electricity || 0, device.faultStatusCode);
+
+    // 9. KÄYNNISTETÄÄN REAALIAIKAINEN MQTT-YHTEYS PILVEEN
+    this.connectMqtt();
+  }
+
+  connectMqtt() {
+    const { device } = this.accessory.context;
+    this.platform.log.info('Avataan reaaliaikainen MQTT-yhteys palvelimeen mqtts.sk-robot.com...');
+
+    this.mqttClient = mqtt.connect('mqtt://mqtts.sk-robot.com', {
+      username: 'app',
+      password: 'h4ijwkTnyrA',
+      clientId: `homebridge_${Math.random().toString(16).substr(2, 8)}`,
+      keepalive: 60,
+    });
+
+    this.mqttClient.on('connect', () => {
+      this.platform.log.info('Suora MQTT-yhteys pilveen muodostettu onnistuneesti!');
+      const topic = `/app/${device.appUserId}/get`;
+      this.mqttClient?.subscribe(topic);
+    });
+
+    this.mqttClient.on('message', (topic, message) => {
+      try {
+        const payload = JSON.parse(message.toString());
+        if (payload.deviceSn === device.deviceSn) {
+          const battery = payload.power !== undefined ? payload.power : (payload.data?.elec || device.electricity);
+          const statusCode = payload.mode !== undefined ? String(payload.mode) : (payload.data?.status !== undefined ? String(payload.data.status) : device.workStatusCode);
+          const faultCode = payload.errortype !== undefined ? (payload.errortype === 0 ? 'normal' : 'error') : device.faultStatusCode;
+
+          this.platform.log.info(`Live MQTT -> Akku: ${battery}%, Tila: ${statusCode}, Virhe: ${faultCode}`);
+          this.updateUI(statusCode, battery, faultCode);
+        }
+      } catch (err) {
+        this.platform.log.error('MQTT-viestin käsittely epäonnistui');
+      }
+    });
+  }
+
+  updateUI(statusCode: string, battery: number, faultCode: string) {
+    const isMowing = statusCode === '1';
+    const isEdgeMowing = statusCode === '4';
+    const isStuck = faultCode !== 'normal' || statusCode === '6';
+
+    this.mainSwitchService.updateCharacteristic(this.platform.Characteristic.On, isMowing);
+    this.edgeSwitchService.updateCharacteristic(this.platform.Characteristic.On, isEdgeMowing);
+    this.stuckSensorService.updateCharacteristic(this.platform.Characteristic.MotionDetected, isStuck);
+    
+    this.batteryService.updateCharacteristic(this.platform.Characteristic.BatteryLevel, battery);
+    this.batteryService.updateCharacteristic(
+      this.platform.Characteristic.StatusLowBattery, 
+      battery < 20 ? this.platform.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW : this.platform.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL,
+    );
+
+    this.batteryGraphService.updateCharacteristic(this.platform.Characteristic.CurrentRelativeHumidity, battery);
+
+    // Tallennetaan arvot historianäkymään
+    this.loggingService.addEntry({
+      time: Math.round(new Date().getTime() / 1000),
+      temp: (isMowing || isEdgeMowing) ? 1 : 0,
+      humidity: battery,
+      pressure: isStuck ? 1 : 0,
+    });
+  }
+
+  async sendCommand(mode: number) {
+    const { accessToken, baseUrl, hostHeader, device } = this.accessory.context;
+    try {
+      const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+      await axios.post(`${baseUrl}/app_mower/device/setWorkStatus`, {
+        appId: device.appUserId,
+        deviceSn: device.deviceSn,
+        mode: mode,
+      }, {
+        headers: {
+          'Authorization': `bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'Host': hostHeader,
+          'User-Agent': 'okhttp/4.8.1',
+        },
+        httpsAgent: httpsAgent,
+      });
+    } catch (error: any) {
+      this.platform.log.error(`Komentovirhe: ${error.message}`);
     }
-
-    // set the service name, this is what is displayed as the default name on the Home app
-    // in this example we are using the name we stored in the `accessory.context` in the `discoverDevices` method.
-    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.exampleDisplayName);
-
-    // each service must implement at-minimum the "required characteristics" for the given service type
-    // see https://developers.homebridge.io/#/service/Lightbulb
-
-    // register handlers for the On/Off Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setOn.bind(this)) // SET - bind to the `setOn` method below
-      .onGet(this.getOn.bind(this)); // GET - bind to the `getOn` method below
-
-    // register handlers for the Brightness Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.Brightness)
-      .onSet(this.setBrightness.bind(this)); // SET - bind to the `setBrightness` method below
-
-    /**
-     * Creating multiple services of the same type.
-     *
-     * To avoid "Cannot add a Service with the same UUID another Service without also defining a unique 'subtype' property." error,
-     * when creating multiple services of the same type, you need to use the following syntax to specify a name and subtype id:
-     * this.accessory.getService('NAME') || this.accessory.addService(this.platform.Service.Lightbulb, 'NAME', 'USER_DEFINED_SUBTYPE_ID');
-     *
-     * The USER_DEFINED_SUBTYPE must be unique to the platform accessory (if you platform exposes multiple accessories, each accessory
-     * can use the same subtype id.)
-     */
-
-    // Example: add two "motion sensor" services to the accessory
-    const motionSensorOneService = this.accessory.getService('Motion Sensor One Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor One Name', 'YourUniqueIdentifier-1');
-
-    const motionSensorTwoService = this.accessory.getService('Motion Sensor Two Name')
-      || this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor Two Name', 'YourUniqueIdentifier-2');
-
-    /**
-     * Updating characteristics values asynchronously.
-     *
-     * Example showing how to update the state of a Characteristic asynchronously instead
-     * of using the `on('get')` handlers.
-     * Here we change update the motion sensor trigger states on and off every 10 seconds
-     * the `updateCharacteristic` method.
-     *
-     */
-    let motionDetected = false;
-    setInterval(() => {
-      // EXAMPLE - inverse the trigger
-      motionDetected = !motionDetected;
-
-      // push the new value to HomeKit
-      motionSensorOneService.updateCharacteristic(this.platform.Characteristic.MotionDetected, motionDetected);
-      motionSensorTwoService.updateCharacteristic(this.platform.Characteristic.MotionDetected, !motionDetected);
-
-      this.platform.log.debug('Triggering motionSensorOneService:', motionDetected);
-      this.platform.log.debug('Triggering motionSensorTwoService:', !motionDetected);
-    }, 10000);
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, turning on a Light bulb.
-   */
-  async setOn(value: CharacteristicValue) {
-    // implement your own code to turn your device on/off
-    this.exampleStates.On = value as boolean;
-
-    this.platform.log.debug('Set Characteristic On ->', value);
+  async setMainSwitchState(value: CharacteristicValue) {
+    await this.sendCommand(value as boolean ? 1 : 2);
   }
 
-  /**
-   * Handle the "GET" requests from HomeKit
-   * These are sent when HomeKit wants to know the current state of the accessory, for example, checking if a Light bulb is on.
-   *
-   * GET requests should return as fast as possible. A long delay here will result in
-   * HomeKit being unresponsive and a bad user experience in general.
-   *
-   * If your device takes time to respond you should update the status of your device
-   * asynchronously instead using the `updateCharacteristic` method instead.
-   * In this case, you may decide not to implement `onGet` handlers, which may speed up
-   * the responsiveness of your device in the Home app.
-
-   * @example
-   * this.service.updateCharacteristic(this.platform.Characteristic.On, true)
-   */
-  async getOn(): Promise<CharacteristicValue> {
-    // implement your own code to check if the device is on
-    const isOn = this.exampleStates.On;
-
-    this.platform.log.debug('Get Characteristic On ->', isOn);
-
-    // if you need to return an error to show the device as "Not Responding" in the Home app:
-    // throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-
-    return isOn;
+  async setEdgeSwitchState(value: CharacteristicValue) {
+    await this.sendCommand(value as boolean ? 4 : 0);
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, changing the Brightness
-   */
-  async setBrightness(value: CharacteristicValue) {
-    // implement your own code to set the brightness
-    this.exampleStates.Brightness = value as number;
+  async setStopButtonState(value: CharacteristicValue) {
+    if (value as boolean) {
+      await this.sendCommand(0);
+      setTimeout(() => {
+        this.stopButtonService.updateCharacteristic(this.platform.Characteristic.On, false);
+      }, 500);
+    }
+  }
 
-    this.platform.log.debug('Set Characteristic Brightness -> ', value);
+  async getMowerState(): Promise<CharacteristicValue> {
+    const device = this.accessory.context.device;
+    return device.workStatusCode === '1' || device.workStatusCode === '4';
   }
 }
