@@ -1,33 +1,70 @@
 {
-  "pluginAlias": "SunseekerMower",
+  "pluginAlias": "SunseekerLawnmower",
   "pluginType": "platform",
   "singular": true,
+  "strictValidation": false,
   "schema": {
     "type": "object",
+    "required": ["name", "email", "password"],
     "properties": {
+      "name": {
+        "title": "Nimi",
+        "type": "string",
+        "default": "Sunseeker Lawnmower",
+        "description": "Nimi, jolla plugin näkyy Homebridgessä."
+      },
       "email": {
         "title": "Sähköpostiosoite",
         "type": "string",
-        "required": true,
         "format": "email",
-        "description": "Tilisi sähköpostiosoite."
+        "description": "Robotic Mower Connect -tilisi sähköpostiosoite."
       },
       "password": {
         "title": "Salasana",
         "type": "string",
-        "required": true
+        "format": "password",
+        "description": "Robotic Mower Connect -tilisi salasana."
       },
-      "serverType": {
-        "title": "Leikkurin tyyppi / Palvelin",
+      "language": {
+        "title": "Language / Kieli",
         "type": "string",
-        "required": true,
-        "default": "old",
-        "description": "Valitse mitä pilvipalvelinta leikkurisi käyttää.",
+        "default": "fi",
+        "description": "Pluginin käyttämä kieli palveluiden nimissä, lokeissa ja pilvikutsujen Accept-Language-headerissa.",
         "oneOf": [
-          { "title": "Vanhat mallit (esim. S-sarja)", "enum": ["old"] },
-          { "title": "Uudet mallit - Eurooppa (X & V -sarjat)", "enum": ["new_eu"] },
-          { "title": "Uudet mallit - USA", "enum": ["new_us"] }
+          { "title": "Suomi", "enum": ["fi"] },
+          { "title": "English", "enum": ["en"] }
         ]
+      },
+      "pollInterval": {
+        "title": "Päivitysväli sekunteina",
+        "type": "integer",
+        "default": 60,
+        "minimum": 15,
+        "description": "Kuinka usein leikkurin tila haetaan pilvestä."
+      },
+      "offCommand": {
+        "title": "Mower-kytkimen OFF-toiminto",
+        "type": "string",
+        "default": "pause",
+        "description": "Mitä tehdään, kun HomeKitin Mower-kytkin laitetaan pois päältä.",
+        "oneOf": [
+          { "title": "Pause", "enum": ["pause"] },
+          { "title": "Return Home", "enum": ["home"] }
+        ]
+      },
+      "enableHistory": {
+        "title": "Eve-historia käyttöön",
+        "type": "boolean",
+        "default": true,
+        "description": "Tallentaa leikkuuhistoriaa Eve-sovellusta varten fakegato-historyllä."
+      },
+      "historySize": {
+        "title": "Eve-historian koko",
+        "type": "integer",
+        "default": 4032,
+        "minimum": 288,
+        "maximum": 10000,
+        "description": "Kuinka monta historiatapahtumaa säilytetään."
       }
     }
   }

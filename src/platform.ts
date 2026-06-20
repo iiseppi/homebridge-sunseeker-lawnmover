@@ -4,6 +4,9 @@ import { SunseekerMowerAccessory } from './platformAccessory.js';
 import axios from 'axios';
 import * as https from 'https';
 
+const BASE_URL = 'https://server.sk-robot.com/api';
+const HOST_HEADER = 'server.sk-robot.com';
+
 export class SunseekerMowerPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
@@ -17,109 +20,118 @@ export class SunseekerMowerPlatform implements DynamicPlatformPlugin {
     this.Service = this.api.hap.Service;
     this.Characteristic = this.api.hap.Characteristic;
 
-    this.log.debug('Plugin alustettu. Odotetaan Homebridgen käynnistymistä...');
+    this.log.debug('Sunseeker Lawnmower plugin alustettu. Odotetaan Homebridgen käynnistymistä...');
 
     this.api.on('didFinishLaunching', () => {
-      this.loginToCloud();
+      this.discoverDevices().catch(error => {
+        this.log.error(`Sunseeker discovery epäonnistui: ${error instanceof Error ? error.message : String(error)}`);
+      });
     });
   }
 
-  async loginToCloud() {
-    const email = this.config.email;
-    const password = this.config.password;
-    const serverType = this.config.serverType || 'old';
+  async discoverDevices(): Promise<void> {
+    const email = String(this.config.email ?? '');
+    const password = String(this.config.password ?? '');
 
     if (!email || !password) {
       this.log.error('Sähköposti tai salasana puuttuu asetuksista!');
       return;
     }
 
-    try {
-      let baseUrl = '';
-      let hostHeader = '';
+    const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
-      if (serverType === 'old') {
-        baseUrl = 'https://server.sk-robot.com/api';
-        hostHeader = 'server.sk-robot.com';
-      } else if (serverType === 'new_eu') {
-        baseUrl = 'https://wirefree-specific.sk-robot.com/api';
-        hostHeader = 'wirefree-specific.sk-robot.com';
-      } else if (serverType === 'new_us') {
-        baseUrl = 'https://wirefree-specific-us.sk-robot.com/api';
-        hostHeader = 'wirefree-specific-us.sk-robot.com';
+    const formData = new URLSearchParams();
+    formData.append('username', email);
+    formData.append('password', password);
+    formData.append('grant_type', 'password');
+    formData.append('scope', 'server');
+
+    this.log.info('Kirjaudutaan Robotic Mower Connect / sk-robot -pilveen...');
+
+    const loginResponse = await axios.post(`${BASE_URL}/auth/oauth/token`, formData, {
+      headers: {
+        'Authorization': 'Basic YXBwOmFwcA==',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'okhttp/4.8.1',
+        'Host': HOST_HEADER,
+        'Connection': 'Keep-Alive',
+      },
+      httpsAgent,
+    });
+
+    const accessToken = loginResponse.data?.access_token;
+
+    if (!accessToken) {
+      throw new Error(`Kirjautuminen ei palauttanut access_tokenia: ${JSON.stringify(loginResponse.data)}`);
+    }
+
+    this.log.info('Kirjautuminen onnistui. Haetaan leikkurit...');
+
+    const deviceResponse = await axios.get(`${BASE_URL}/mower/device-user/list`, {
+      headers: {
+        'Authorization': `bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Accept-Language': 'fi',
+        'Host': HOST_HEADER,
+        'User-Agent': 'okhttp/4.4.1',
+      },
+      httpsAgent,
+    });
+
+    const devices = Array.isArray(deviceResponse.data?.data) ? deviceResponse.data.data : [];
+
+    if (devices.length === 0) {
+      this.log.warn(`Pilvi ei palauttanut yhtään leikkuria. Raw response: ${JSON.stringify(deviceResponse.data)}`);
+      return;
+    }
+
+    const discoveredUUIDs: string[] = [];
+
+    for (const device of devices) {
+      const deviceSn = String(device.deviceSn ?? device.sn ?? '');
+
+      if (!deviceSn) {
+        this.log.warn(`Ohitetaan laite, koska deviceSn puuttuu: ${JSON.stringify(device)}`);
+        continue;
       }
 
-      const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+      const uuid = this.api.hap.uuid.generate(deviceSn);
+      discoveredUUIDs.push(uuid);
 
-      const formData = new URLSearchParams();
-      formData.append('username', email);
-      formData.append('password', password);
-      formData.append('grant_type', 'password');
-      formData.append('scope', 'server');
+      const displayName = String(device.deviceName ?? device.name ?? device.modelName ?? 'Sunseeker Mower');
+      const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
 
-      // 1. Kirjautuminen pilveen
-      const loginResponse = await axios.post(`${baseUrl}/auth/oauth/token`, formData, {
-        headers: {
-          'Authorization': 'Basic YXBwOmFwcA==', 
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'okhttp/4.8.1',
-          'Host': hostHeader,
-          'Connection': 'Keep-Alive',
-        },
-        httpsAgent: httpsAgent,
-      });
+      if (existingAccessory) {
+        this.log.info(`Päivitetään leikkuri välimuistista: ${displayName}`);
+        existingAccessory.context.device = device;
+        existingAccessory.context.accessToken = accessToken;
+        existingAccessory.context.baseUrl = BASE_URL;
+        existingAccessory.context.hostHeader = HOST_HEADER;
 
-      const accessToken = loginResponse.data.access_token;
+        new SunseekerMowerAccessory(this, existingAccessory);
+      } else {
+        this.log.info(`Luodaan uusi HomeKit-laite leikkurille: ${displayName}`);
+        const accessory = new this.api.platformAccessory(displayName, uuid);
+        accessory.context.device = device;
+        accessory.context.accessToken = accessToken;
+        accessory.context.baseUrl = BASE_URL;
+        accessory.context.hostHeader = HOST_HEADER;
 
-      // 2. Haetaan laitelista
-      const listEndpoint = serverType === 'old' 
-        ? '/mower/device-user/list' 
-        : '/app_wireless_mower/device-user/getCustomDevice?all=true';
-
-      const deviceResponse = await axios.get(`${baseUrl}${listEndpoint}`, {
-        headers: {
-          'Authorization': `bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-          'Accept-Language': 'fi',
-          'Host': hostHeader,
-          'User-Agent': 'okhttp/4.4.1',
-        },
-        httpsAgent: httpsAgent,
-      });
-
-      if (deviceResponse.data && deviceResponse.data.data && deviceResponse.data.data.length > 0) {
-        for (const device of deviceResponse.data.data) {
-          const uuid = this.api.hap.uuid.generate(device.deviceSn);
-          const existingAccessory = this.accessories.find(accessory => accessory.UUID === uuid);
-
-          if (existingAccessory) {
-            this.log.info(`Päivitetään leikkuri välimuistista: ${device.deviceName}`);
-            existingAccessory.context.device = device;
-            existingAccessory.context.accessToken = accessToken;
-            existingAccessory.context.baseUrl = baseUrl;
-            existingAccessory.context.hostHeader = hostHeader;
-            
-            new SunseekerMowerAccessory(this, existingAccessory);
-          } else {
-            this.log.info(`Luodaan uusi HomeKit-laite leikkurille: ${device.deviceName}`);
-            const accessory = new this.api.platformAccessory(device.deviceName || 'Mower', uuid);
-            accessory.context.device = device;
-            accessory.context.accessToken = accessToken;
-            accessory.context.baseUrl = baseUrl;
-            accessory.context.hostHeader = hostHeader;
-
-            new SunseekerMowerAccessory(this, accessory);
-            this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-          }
-        }
+        new SunseekerMowerAccessory(this, accessory);
+        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       }
+    }
 
-    } catch (error: any) {
-      this.log.error('Pilviyhteys epäonnistui:', error.message);
+    for (const accessory of this.accessories) {
+      if (!discoveredUUIDs.includes(accessory.UUID)) {
+        this.log.info(`Poistetaan välimuistista kadonnut leikkuri: ${accessory.displayName}`);
+        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      }
     }
   }
 
-  configureAccessory(accessory: PlatformAccessory) {
+  configureAccessory(accessory: PlatformAccessory): void {
+    this.log.debug(`Ladattiin accessory välimuistista: ${accessory.displayName}`);
     this.accessories.push(accessory);
   }
 }

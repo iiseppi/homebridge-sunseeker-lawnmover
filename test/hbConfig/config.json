@@ -1,13 +1,13 @@
 {
   "bridge": {
-    "name": "PluginTemplate",
+    "name": "Sunseeker Test",
     "username": "AA:BB:CC:DD:EE:FF",
     "port": 51826,
     "pin": "031-45-154"
   },
-  "description": "HomeBridge HTTP Status Control",
+  "description": "Homebridge Sunseeker Lawnmower test config",
   "plugins": [
-    "homebridge-plugin-name",
+    "homebridge-sunseeker-lawnmover",
     "homebridge-config-ui-x"
   ],
   "platforms": [
@@ -23,8 +23,15 @@
       "debug": false
     },
     {
-      "name": "homebridge-plugin-name",
-      "platform": "ExampleHomebridgePlugin"
+      "platform": "SunseekerLawnmower",
+      "name": "Sunseeker Lawnmower",
+      "email": "OMA_EMAIL",
+      "password": "OMA_SALASANA",
+      "language": "fi",
+      "pollInterval": 60,
+      "offCommand": "pause",
+      "enableHistory": true,
+      "historySize": 4032
     }
   ],
   "accessories": []

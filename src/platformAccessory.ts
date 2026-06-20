@@ -1,166 +1,369 @@
-import { Service, PlatformAccessory, CharacteristicValue } from 'homebridge';
-import { SunseekerMowerPlatform } from './platform.js';
+import { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
 import axios from 'axios';
 import * as https from 'https';
-import * as mqtt from 'mqtt';
-// @ts-ignore
+import { SunseekerMowerPlatform } from './platform.js';
+// @ts-ignore fakegato-history does not ship TypeScript types
 import fakegato from 'fakegato-history';
 
+type NormalizedMowerState = {
+  battery: number;
+  isMowing: boolean;
+  isCharging: boolean;
+  isOnline: boolean;
+  hasFault: boolean;
+  rawStatus: string;
+  rawFault: string;
+};
+
+type LanguageCode = 'fi' | 'en';
+
+type TranslationSet = {
+  manufacturer: string;
+  defaultModel: string;
+  serviceMower: string;
+  serviceHome: string;
+  serviceMowing: string;
+  serviceCharging: string;
+  serviceOnline: string;
+  serviceFault: string;
+  removeOldService: string;
+  historyInitFailed: string;
+  firstUpdateFailed: string;
+  updateFailed: string;
+  missingDeviceSnContext: string;
+  missingDeviceSnCommand: string;
+  missingAppId: string;
+  updateUi: string;
+  historyEntryFailed: string;
+  commandResponse: string;
+  commandError: string;
+};
+
+const TRANSLATIONS: Record<LanguageCode, TranslationSet> = {
+  fi: {
+    manufacturer: 'Sunseeker / Brucke',
+    defaultModel: 'RM501',
+    serviceMower: 'Leikkaus',
+    serviceHome: 'Kotiin',
+    serviceMowing: 'Leikkaa',
+    serviceCharging: 'Latauksessa',
+    serviceOnline: 'Online',
+    serviceFault: 'Virhe',
+    removeOldService: 'Poistetaan vanha haamupalvelu välimuistista',
+    historyInitFailed: 'Eve-historian alustus epäonnistui',
+    firstUpdateFailed: 'Ensimmäinen tilapäivitys epäonnistui',
+    updateFailed: 'Tilapäivitys epäonnistui',
+    missingDeviceSnContext: 'deviceSn puuttuu accessory contextista',
+    missingDeviceSnCommand: 'deviceSn puuttuu, komentoa ei voida lähettää',
+    missingAppId: 'appId/userId puuttuu, komentoa ei voida lähettää',
+    updateUi: 'Päivitetään UI',
+    historyEntryFailed: 'Eve-historiatapahtuman tallennus epäonnistui',
+    commandResponse: 'Komento vastaus',
+    commandError: 'Komentovirhe',
+  },
+  en: {
+    manufacturer: 'Sunseeker / Brucke',
+    defaultModel: 'RM501',
+    serviceMower: 'Mowing',
+    serviceHome: 'Return Home',
+    serviceMowing: 'Mowing Active',
+    serviceCharging: 'Charging',
+    serviceOnline: 'Online',
+    serviceFault: 'Fault',
+    removeOldService: 'Removing old cached service',
+    historyInitFailed: 'Failed to initialize Eve history',
+    firstUpdateFailed: 'Initial status update failed',
+    updateFailed: 'Status update failed',
+    missingDeviceSnContext: 'deviceSn is missing from accessory context',
+    missingDeviceSnCommand: 'deviceSn is missing, command cannot be sent',
+    missingAppId: 'appId/userId is missing, command cannot be sent',
+    updateUi: 'Updating UI',
+    historyEntryFailed: 'Failed to save Eve history entry',
+    commandResponse: 'Command response',
+    commandError: 'Command error',
+  },
+};
+
+function getLanguageCode(language: unknown): LanguageCode {
+  const value = String(language ?? 'fi').toLowerCase();
+  return value.startsWith('en') ? 'en' : 'fi';
+}
+
 export class SunseekerMowerAccessory {
-  private mainSwitchService: Service;
-  private edgeSwitchService: Service;
-  private stopButtonService: Service;
-  private batteryService: Service;
-  private stuckSensorService: Service;
-  private batteryGraphService: Service;
-  
-  private mqttClient?: mqtt.MqttClient;
-  private loggingService: any;
+  private readonly mowerSwitchService: Service;
+  private readonly homeSwitchService: Service;
+  private readonly batteryService: Service;
+  private readonly mowingSensorService: Service;
+  private readonly chargingSensorService: Service;
+  private readonly onlineSensorService: Service;
+  private readonly faultSensorService: Service;
+
+  private readonly httpsAgent = new https.Agent({ rejectUnauthorized: false });
+  private readonly loggingService?: any;
+  private pollTimer?: NodeJS.Timeout;
+  private lastState: NormalizedMowerState;
+  private lastHistoryValue?: number;
+  private readonly language: LanguageCode;
+  private readonly text: TranslationSet;
 
   constructor(
     private readonly platform: SunseekerMowerPlatform,
     private readonly accessory: PlatformAccessory,
   ) {
     const device = this.accessory.context.device;
-    const FakeGatoHistoryService = fakegato(this.platform.api);
 
-    // --- SIIVOTAAN VANHAT HAAMUPALVELUT VÄLIMUISTISTA ---
-    const allowedSubtypes = ['main_mow', 'edge_mow', 'stop_btn', 'stuck_sensor', 'battery_graph'];
-    this.accessory.services.forEach((service) => {
-      if (
-        (service.UUID === this.platform.Service.Switch.UUID || 
-         service.UUID === this.platform.Service.MotionSensor.UUID ||
-         service.UUID === this.platform.Service.HumiditySensor.UUID) &&
-        (!service.subtype || !allowedSubtypes.includes(service.subtype))
-      ) {
-        this.platform.log.info(`Poistetaan vanha haamupalvelu välimuistista: ${service.displayName}`);
-        this.accessory.removeService(service);
-      }
-    });
+    this.language = getLanguageCode(this.platform.config.language);
+    this.text = TRANSLATIONS[this.language];
 
-    // 1. Alustetaan FakeGato-historia sääprofiililla
-    this.loggingService = new FakeGatoHistoryService('weather', this.accessory, {
-      storage: 'fs',
-      filename: `homebridge-sunseeker-history_${device.deviceSn}.json`,
-    });
+    this.cleanupOldServices();
 
-    // 2. Laitetiedot Apple Kotiin
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
-      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Sunseeker / G-Force')
-      .setCharacteristic(this.platform.Characteristic.Model, device.deviceModelName || 'Mower S-Series')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, device.deviceSn);
+      .setCharacteristic(this.platform.Characteristic.Manufacturer, this.text.manufacturer)
+      .setCharacteristic(this.platform.Characteristic.Model, String(device.deviceModelName ?? device.modelName ?? this.text.defaultModel))
+      .setCharacteristic(this.platform.Characteristic.SerialNumber, String(device.deviceSn ?? device.sn ?? 'unknown'));
 
-    // 3. Pääkytkin: LEIKKAUS
-    this.mainSwitchService = this.accessory.getService('Leikkaus') || 
-                             this.accessory.addService(this.platform.Service.Switch, 'Leikkaus', 'main_mow');
-    this.mainSwitchService.setCharacteristic(this.platform.Characteristic.Name, 'Leikkaus');
-    this.mainSwitchService.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setMainSwitchState.bind(this))
+    this.mowerSwitchService = this.accessory.getServiceById(this.platform.Service.Switch, 'main_mow') ||
+      this.accessory.addService(this.platform.Service.Switch, this.text.serviceMower, 'main_mow');
+    this.mowerSwitchService.setCharacteristic(this.platform.Characteristic.Name, this.text.serviceMower);
+    this.mowerSwitchService.getCharacteristic(this.platform.Characteristic.On)
+      .onSet(this.setMowerSwitchState.bind(this))
       .onGet(this.getMowerState.bind(this));
 
-    // 4. Alikytkin: REUNALEIKKUU
-    this.edgeSwitchService = this.accessory.getService('Reunaleikkuu') || 
-                             this.accessory.addService(this.platform.Service.Switch, 'Reunaleikkuu', 'edge_mow');
-    this.edgeSwitchService.setCharacteristic(this.platform.Characteristic.Name, 'Reunaleikkuu');
-    this.edgeSwitchService.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setEdgeSwitchState.bind(this));
+    this.homeSwitchService = this.accessory.getServiceById(this.platform.Service.Switch, 'return_home') ||
+      this.accessory.addService(this.platform.Service.Switch, this.text.serviceHome, 'return_home');
+    this.homeSwitchService.setCharacteristic(this.platform.Characteristic.Name, this.text.serviceHome);
+    this.homeSwitchService.getCharacteristic(this.platform.Characteristic.On)
+      .onSet(this.setHomeSwitchState.bind(this));
 
-    // 5. Painike: PYSÄYTÄ
-    this.stopButtonService = this.accessory.getService('Pysäytä') || 
-                             this.accessory.addService(this.platform.Service.Switch, 'Pysäytä', 'stop_btn');
-    this.stopButtonService.setCharacteristic(this.platform.Characteristic.Name, 'Pysäytä');
-    this.stopButtonService.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setStopButtonState.bind(this));
+    this.batteryService = this.accessory.getService(this.platform.Service.Battery) ||
+      this.accessory.addService(this.platform.Service.Battery);
 
-    // 6. Liiketunnistin: JUMIUTUMISEN ILMAISIN
-    this.stuckSensorService = this.accessory.getService('Mower Jumissa') || 
-                              this.accessory.addService(this.platform.Service.MotionSensor, 'Mower Jumissa', 'stuck_sensor');
-    this.stuckSensorService.setCharacteristic(this.platform.Characteristic.Name, 'Mower Jumissa');
+    this.mowingSensorService = this.accessory.getServiceById(this.platform.Service.OccupancySensor, 'mowing_sensor') ||
+      this.accessory.addService(this.platform.Service.OccupancySensor, this.text.serviceMowing, 'mowing_sensor');
+    this.mowingSensorService.setCharacteristic(this.platform.Characteristic.Name, this.text.serviceMowing);
 
-    // 7. AKKUPALVELU (Apple taustajärjestelmä)
-    this.batteryService = this.accessory.getService(this.platform.Service.Battery) || 
-                          this.accessory.addService(this.platform.Service.Battery);
+    this.chargingSensorService = this.accessory.getServiceById(this.platform.Service.ContactSensor, 'charging_sensor') ||
+      this.accessory.addService(this.platform.Service.ContactSensor, this.text.serviceCharging, 'charging_sensor');
+    this.chargingSensorService.setCharacteristic(this.platform.Characteristic.Name, this.text.serviceCharging);
 
-    // 8. EVE-AKKUGRAAFI (Kosteusanturi akun seurantaan)
-    this.batteryGraphService = this.accessory.getService('Akun varaus') ||
-                               this.accessory.addService(this.platform.Service.HumiditySensor, 'Akun varaus', 'battery_graph');
-    this.batteryGraphService.setCharacteristic(this.platform.Characteristic.Name, 'Akun varaus');
+    this.onlineSensorService = this.accessory.getServiceById(this.platform.Service.ContactSensor, 'online_sensor') ||
+      this.accessory.addService(this.platform.Service.ContactSensor, this.text.serviceOnline, 'online_sensor');
+    this.onlineSensorService.setCharacteristic(this.platform.Characteristic.Name, this.text.serviceOnline);
 
-    // Päivitetään alkutilanne HTTP-datasta
-    this.updateUI(device.workStatusCode, device.electricity || 0, device.faultStatusCode);
+    this.faultSensorService = this.accessory.getServiceById(this.platform.Service.MotionSensor, 'fault_sensor') ||
+      this.accessory.addService(this.platform.Service.MotionSensor, this.text.serviceFault, 'fault_sensor');
+    this.faultSensorService.setCharacteristic(this.platform.Characteristic.Name, this.text.serviceFault);
 
-    // 9. KÄYNNISTETÄÄN REAALIAIKAINEN MQTT-YHTEYS PILVEEN
-    this.connectMqtt();
+    this.lastState = this.normalizeState(device);
+    this.updateUI(this.lastState);
+
+    if (this.platform.config.enableHistory !== false) {
+      this.loggingService = this.setupHistory(String(device.deviceSn ?? device.sn ?? this.accessory.UUID));
+    }
+
+    this.startPolling();
   }
 
-  connectMqtt() {
-    const { device } = this.accessory.context;
-    this.platform.log.info('Avataan reaaliaikainen MQTT-yhteys palvelimeen mqtts.sk-robot.com...');
+  private cleanupOldServices(): void {
+    const allowedSubtypes = [
+      'main_mow',
+      'return_home',
+      'mowing_sensor',
+      'charging_sensor',
+      'online_sensor',
+      'fault_sensor',
+    ];
 
-    this.mqttClient = mqtt.connect('mqtt://mqtts.sk-robot.com', {
-      username: 'app',
-      password: 'h4ijwkTnyrA',
-      clientId: `homebridge_${Math.random().toString(16).substr(2, 8)}`,
-      keepalive: 60,
-    });
-
-    this.mqttClient.on('connect', () => {
-      this.platform.log.info('Suora MQTT-yhteys pilveen muodostettu onnistuneesti!');
-      const topic = `/app/${device.appUserId}/get`;
-      this.mqttClient?.subscribe(topic);
-    });
-
-    this.mqttClient.on('message', (topic, message) => {
-      try {
-        const payload = JSON.parse(message.toString());
-        if (payload.deviceSn === device.deviceSn) {
-          const battery = payload.power !== undefined ? payload.power : (payload.data?.elec || device.electricity);
-          const statusCode = payload.mode !== undefined ? String(payload.mode) : (payload.data?.status !== undefined ? String(payload.data.status) : device.workStatusCode);
-          const faultCode = payload.errortype !== undefined ? (payload.errortype === 0 ? 'normal' : 'error') : device.faultStatusCode;
-
-          this.platform.log.info(`Live MQTT -> Akku: ${battery}%, Tila: ${statusCode}, Virhe: ${faultCode}`);
-          this.updateUI(statusCode, battery, faultCode);
-        }
-      } catch (err) {
-        this.platform.log.error('MQTT-viestin käsittely epäonnistui');
+    for (const service of [...this.accessory.services]) {
+      if (service.UUID === this.platform.Service.AccessoryInformation.UUID || service.UUID === this.platform.Service.Battery.UUID) {
+        continue;
       }
-    });
+
+      if (!service.subtype || !allowedSubtypes.includes(service.subtype)) {
+        this.platform.log.info(`${this.text.removeOldService}: ${service.displayName}`);
+        this.accessory.removeService(service);
+      }
+    }
   }
 
-  updateUI(statusCode: string, battery: number, faultCode: string) {
-    const isMowing = statusCode === '1';
-    const isEdgeMowing = statusCode === '4';
-    const isStuck = faultCode !== 'normal' || statusCode === '6';
+  private setupHistory(deviceSn: string): any | undefined {
+    try {
+      const FakeGatoHistoryService = fakegato(this.platform.api);
+      return new FakeGatoHistoryService('motion', this.accessory, {
+        storage: 'fs',
+        size: Number(this.platform.config.historySize ?? 4032),
+        filename: `homebridge-sunseeker-mowing-history_${deviceSn}.json`,
+      });
+    } catch (error) {
+      this.platform.log.warn(`${this.text.historyInitFailed}: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
 
-    this.mainSwitchService.updateCharacteristic(this.platform.Characteristic.On, isMowing);
-    this.edgeSwitchService.updateCharacteristic(this.platform.Characteristic.On, isEdgeMowing);
-    this.stuckSensorService.updateCharacteristic(this.platform.Characteristic.MotionDetected, isStuck);
-    
-    this.batteryService.updateCharacteristic(this.platform.Characteristic.BatteryLevel, battery);
-    this.batteryService.updateCharacteristic(
-      this.platform.Characteristic.StatusLowBattery, 
-      battery < 20 ? this.platform.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW : this.platform.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL,
+  private startPolling(): void {
+    const pollInterval = Math.max(15, Number(this.platform.config.pollInterval ?? 60));
+
+    this.updateFromCloud().catch(error => {
+      this.platform.log.warn(`${this.text.firstUpdateFailed}: ${error instanceof Error ? error.message : String(error)}`);
+    });
+
+    this.pollTimer = setInterval(() => {
+      this.updateFromCloud().catch(error => {
+        this.platform.log.warn(`${this.text.updateFailed}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }, pollInterval * 1000);
+  }
+
+  private async updateFromCloud(): Promise<void> {
+    const { accessToken, baseUrl, hostHeader, device } = this.accessory.context;
+    const deviceSn = String(device.deviceSn ?? device.sn ?? '');
+
+    if (!deviceSn) {
+      throw new Error(this.text.missingDeviceSnContext);
+    }
+
+    const response = await axios.get(`${baseUrl}/mower/device/getBysn?sn=${encodeURIComponent(deviceSn)}`, {
+      headers: {
+        'Authorization': `bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'Accept-Language': this.language,
+        'Host': hostHeader,
+        'User-Agent': 'okhttp/4.4.1',
+      },
+      httpsAgent: this.httpsAgent,
+    });
+
+    this.platform.log.debug(`Raw RM501 status for ${deviceSn}: ${JSON.stringify(response.data)}`);
+
+    const rawDevice = response.data?.data ?? response.data;
+    this.accessory.context.device = {
+      ...device,
+      ...rawDevice,
+      deviceSn,
+    };
+
+    const state = this.normalizeState(this.accessory.context.device);
+    this.lastState = state;
+    this.updateUI(state);
+    this.addHistoryEntry(state);
+  }
+
+  private normalizeState(raw: any): NormalizedMowerState {
+    const rawStatusValue = raw?.workStatusCode ?? raw?.workStatus ?? raw?.status ?? raw?.mode ?? 'unknown';
+    const rawFaultValue = raw?.faultStatusCode ?? raw?.faultStatus ?? raw?.faultCode ?? raw?.errorCode ?? 'normal';
+    const batteryValue = raw?.electricity ?? raw?.electricQuantity ?? raw?.battery ?? raw?.power ?? 0;
+    const onlineValue = raw?.online ?? raw?.onlineFlag ?? raw?.deviceOnline ?? true;
+
+    const rawStatus = String(rawStatusValue);
+    const rawFault = String(rawFaultValue);
+    const battery = this.clampBattery(Number(batteryValue));
+
+    const isMowing = rawStatus === '1' || rawStatus.toLowerCase() === 'mowing';
+    const isCharging = rawStatus === '3' || rawStatus.toLowerCase() === 'charging';
+    const hasFault = (rawFault !== 'normal' && rawFault !== '0' && rawFault !== 'undefined') || rawStatus === '6';
+    const isOnline = !(onlineValue === false || onlineValue === 0 || onlineValue === '0' || rawStatus.toLowerCase() === 'offline');
+
+    return {
+      battery,
+      isMowing,
+      isCharging,
+      isOnline,
+      hasFault,
+      rawStatus,
+      rawFault,
+    };
+  }
+
+  private clampBattery(value: number): number {
+    if (!Number.isFinite(value)) {
+      return 0;
+    }
+
+    return Math.max(0, Math.min(100, Math.round(value)));
+  }
+
+  private updateUI(state: NormalizedMowerState): void {
+    this.platform.log.debug(
+      `${this.text.updateUi}: battery=${state.battery}, mowing=${state.isMowing}, charging=${state.isCharging}, online=${state.isOnline}, fault=${state.hasFault}, rawStatus=${state.rawStatus}, rawFault=${state.rawFault}`,
     );
 
-    this.batteryGraphService.updateCharacteristic(this.platform.Characteristic.CurrentRelativeHumidity, battery);
+    this.mowerSwitchService.updateCharacteristic(this.platform.Characteristic.On, state.isMowing);
 
-    // Tallennetaan arvot historianäkymään
-    this.loggingService.addEntry({
-      time: Math.round(new Date().getTime() / 1000),
-      temp: (isMowing || isEdgeMowing) ? 1 : 0,
-      humidity: battery,
-      pressure: isStuck ? 1 : 0,
-    });
+    this.mowingSensorService.updateCharacteristic(
+      this.platform.Characteristic.OccupancyDetected,
+      state.isMowing
+        ? this.platform.Characteristic.OccupancyDetected.OCCUPANCY_DETECTED
+        : this.platform.Characteristic.OccupancyDetected.OCCUPANCY_NOT_DETECTED,
+    );
+
+    this.chargingSensorService.updateCharacteristic(
+      this.platform.Characteristic.ContactSensorState,
+      state.isCharging
+        ? this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED
+        : this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED,
+    );
+
+    this.onlineSensorService.updateCharacteristic(
+      this.platform.Characteristic.ContactSensorState,
+      state.isOnline
+        ? this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED
+        : this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED,
+    );
+
+    this.faultSensorService.updateCharacteristic(
+      this.platform.Characteristic.MotionDetected,
+      state.hasFault,
+    );
+
+    this.batteryService.updateCharacteristic(this.platform.Characteristic.BatteryLevel, state.battery);
+    this.batteryService.updateCharacteristic(
+      this.platform.Characteristic.StatusLowBattery,
+      state.battery < 20
+        ? this.platform.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
+        : this.platform.Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL,
+    );
   }
 
-  async sendCommand(mode: number) {
-    const { accessToken, baseUrl, hostHeader, device } = this.accessory.context;
+  private addHistoryEntry(state: NormalizedMowerState): void {
+    if (!this.loggingService) {
+      return;
+    }
+
+    const historyValue = state.isMowing ? 1 : 0;
+
+    if (historyValue === this.lastHistoryValue) {
+      return;
+    }
+
     try {
-      const httpsAgent = new https.Agent({ rejectUnauthorized: false });
-      await axios.post(`${baseUrl}/app_mower/device/setWorkStatus`, {
-        appId: device.appUserId,
-        deviceSn: device.deviceSn,
-        mode: mode,
+      this.loggingService.addEntry({
+        time: Math.round(Date.now() / 1000),
+        status: historyValue,
+      });
+      this.lastHistoryValue = historyValue;
+    } catch (error) {
+      this.platform.log.debug(`${this.text.historyEntryFailed}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async sendCommand(mode: number): Promise<void> {
+    const { accessToken, baseUrl, hostHeader, device } = this.accessory.context;
+    const deviceSn = String(device.deviceSn ?? device.sn ?? '');
+    const appId = device.appUserId ?? device.userId;
+
+    if (!deviceSn) {
+      throw new Error(this.text.missingDeviceSnCommand);
+    }
+
+    if (!appId) {
+      throw new Error(this.text.missingAppId);
+    }
+
+    try {
+      const response = await axios.post(`${baseUrl}/app_mower/device/setWorkStatus`, {
+        appId,
+        deviceSn,
+        mode,
       }, {
         headers: {
           'Authorization': `bearer ${accessToken}`,
@@ -168,32 +371,44 @@ export class SunseekerMowerAccessory {
           'Host': hostHeader,
           'User-Agent': 'okhttp/4.8.1',
         },
-        httpsAgent: httpsAgent,
+        httpsAgent: this.httpsAgent,
       });
-    } catch (error: any) {
-      this.platform.log.error(`Komentovirhe: ${error.message}`);
+
+      this.platform.log.debug(`${this.text.commandResponse} mode=${mode}: ${JSON.stringify(response.data)}`);
+    } catch (error) {
+      this.platform.log.error(`${this.text.commandError} mode=${mode}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
     }
   }
 
-  async setMainSwitchState(value: CharacteristicValue) {
-    await this.sendCommand(value as boolean ? 1 : 2);
-  }
+  private async setMowerSwitchState(value: CharacteristicValue): Promise<void> {
+    const isOn = value as boolean;
 
-  async setEdgeSwitchState(value: CharacteristicValue) {
-    await this.sendCommand(value as boolean ? 4 : 0);
-  }
-
-  async setStopButtonState(value: CharacteristicValue) {
-    if (value as boolean) {
-      await this.sendCommand(0);
-      setTimeout(() => {
-        this.stopButtonService.updateCharacteristic(this.platform.Characteristic.On, false);
-      }, 500);
+    if (isOn) {
+      await this.sendCommand(1);
+    } else {
+      const offCommand = String(this.platform.config.offCommand ?? 'pause');
+      await this.sendCommand(offCommand === 'home' ? 2 : 0);
     }
+
+    await this.updateFromCloud();
   }
 
-  async getMowerState(): Promise<CharacteristicValue> {
-    const device = this.accessory.context.device;
-    return device.workStatusCode === '1' || device.workStatusCode === '4';
+  private async setHomeSwitchState(value: CharacteristicValue): Promise<void> {
+    if (!(value as boolean)) {
+      return;
+    }
+
+    await this.sendCommand(2);
+
+    setTimeout(() => {
+      this.homeSwitchService.updateCharacteristic(this.platform.Characteristic.On, false);
+    }, 1000);
+
+    await this.updateFromCloud();
+  }
+
+  private async getMowerState(): Promise<CharacteristicValue> {
+    return this.lastState.isMowing;
   }
 }
